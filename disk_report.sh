@@ -1,4 +1,50 @@
 #!/bin/bash
+#
+# ============================================================================
+#  disk_check.sh — PVE / Linux 磁盘健康巡检日报脚本
+# ============================================================================
+#
+#  功能
+#  ----
+#    每日采集 NVMe (/dev/nvme0n1) 与 SATA (/dev/sda) 盘的 SMART 健康数据，
+#    汇总成文本报告并发送邮件。采集内容包括：
+#      - 剩余寿命百分比（NVMe Percentage Used / SATA 202·177 多通道）
+#      - 累计读/写总量（NVMe Data Units / SATA devstat·241/242/246 多通道）
+#      - 温度、通电次数、累计通电小时、不安全断电次数
+#      - 实时 I/O 简报（iostat）
+#
+#  依赖
+#  ----
+#    smartmontools / util-linux / sysstat / bsd-mailx
+#    首次运行会自动检测并通过 apt 安装缺失项（Debian/Ubuntu 系）
+#
+#  快速上手
+#  --------
+#    1. 配置收件人邮箱（环境变量，未配置时脚本会拒绝运行）：
+#         export DISK_CHECK_EMAIL=you@example.com
+#       建议写入 /etc/environment 或 cron 定义行持久化
+#    2. 以 root 手动运行一次验证：
+#         sudo -E bash disk_check.sh
+#    3. 挂 cron 定时执行（每天 08:00）：
+#         crontab -e
+#         DISK_CHECK_EMAIL=you@example.com
+#         0 8 * * * root /opt/disk_check.sh
+#
+#  ⚠ 注意事项
+#  ---------
+#    - mail 命令依赖本机 MTA（postfix / msmtp 等），需先配好发信链路；
+#      发送失败时报告会保留在 /tmp/disk_report.txt 便于排查
+#    - 依赖自动安装仅支持 apt 系发行版，其他发行版请手动安装等价包
+#    - flock 防重入：同一时刻只有一个实例在跑，重复触发会直接退出
+#
+#  已知限制
+#  --------
+#    - 仅覆盖 nvme0n1 和 sda 各一块盘，多盘机器请参照第 2/3 节自行扩展
+#    - 部分老固件盘（如三星 850 EVO）不提供累计读/断电计数字段，
+#      对应项会显示 N/A，属固件限制而非脚本问题
+#
+#  License: MIT
+# ============================================================================
 
 # ==================== 0. 防重入锁 ====================
 # flock 保证同一时刻只有一个实例在跑，后到的直接退出
@@ -6,8 +52,17 @@ LOCK_FILE="/tmp/disk_check.lock"
 exec 9>"$LOCK_FILE"
 flock -n 9 || { echo "已有巡检实例在运行，本次跳过"; exit 1; }
 
+# smartctl/iostat 等采集命令均需要 root 权限，非 root 直接退出避免发出全 N/A 的废报告
+[ "$(id -u)" -ne 0 ] && { echo "ERROR: 请以 root 运行（smartctl 需要 root 权限）" >&2; exit 1; }
+
 # ==================== 1. 基础配置与依赖检查 ====================
-RECIPIENT="alan_dai@qq.com"
+# 优先从系统环境变量读取收件人邮箱，未设置时自动使用默认占位邮箱
+RECIPIENT="${DISK_CHECK_EMAIL:-your_email@example.com}"
+if [ "$RECIPIENT" = "your_email@example.com" ]; then
+    echo "ERROR: 未配置收件人邮箱，请先设置环境变量再运行：" >&2
+    echo "  export DISK_CHECK_EMAIL=you@example.com" >&2
+    exit 1
+fi
 SUBJECT="【$(hostname) 磁盘健康巡检日报】 $(date +'%Y-%m-%d %H:%M')"
 REPORT_FILE="/tmp/disk_report.txt"
 
@@ -47,9 +102,13 @@ if [ -b "$NVME_DEV" ]; then
     [ -z "$NVME_MODEL" ] && NVME_MODEL=$(echo "$NVME_SMART" | grep -i "Model Number:" | awk -F':' '{print $2}' | xargs)
     [ -z "$NVME_MODEL" ] && NVME_MODEL="NVMe SSD"
 
-    # 寿命获取（${VAR:-0} 兜底，SMART 抓取失败时按 0 处理，避免算术空值报错）
+    # 寿命获取（抓取失败时显示"未知"，避免误导性的 100%）
     NVME_USED=$(echo "$NVME_SMART" | grep -i "Percentage Used:" | awk -F':' '{print $2}' | tr -d ' %' | grep -oE '[0-9]+' | head -n1)
-    NVME_LIFE="$((100 - ${NVME_USED:-0}))%"
+    if [ -n "$NVME_USED" ]; then
+        NVME_LIFE="$((100 - NVME_USED))%"
+    else
+        NVME_LIFE="未知"
+    fi
 
     # 读写总量提取（smartctl 自带 [xx TB] 单位，直接取方括号内容）
     NVME_READ_TB=$(echo "$NVME_SMART" | grep -i "Data Units Read:" | awk -F'[' '{print $2}' | tr -d ']' | xargs)
@@ -79,7 +138,7 @@ if [ -b "$SATA_DEV" ]; then
 
     SATA_HOURS=$(echo "$SATA_SMART" | grep -iE "Power_On_Hours|Power-on Hours" | grep -oE '[0-9]+' | tail -n1)
 
-    # 通电次数与不安全断电（174 优先，192 兜底；850 EVO 固件无此两字段时输出 N/A）
+    # 通电次数与不安全断电
     SATA_POWER_CYCLE=$(echo "$SATA_SMART" | grep -E "\b12 Power_Cycle_Count\b" | awk '{print $NF}')
     SATA_UNSAFE=$(echo "$SATA_SMART" | grep -E "\b174 Unexpect_Power_Loss_Ct\b" | awk '{print $NF}')
     [ -z "$SATA_UNSAFE" ] && SATA_UNSAFE=$(echo "$SATA_SMART" | grep -E "\b192 Power-Off_Retract_Count\b" | awk '{print $NF}')
@@ -88,10 +147,7 @@ if [ -b "$SATA_DEV" ]; then
     SATA_TEMP=$(echo "$SATA_SMART" | grep -i "Current Temperature:" | head -n1 | awk '{print $3}')
     [ -z "$SATA_TEMP" ] && SATA_TEMP=$(echo "$SATA_SMART" | grep -E "194 Temperature_Celsius|190 Airflow_Temperature" | awk '{print $NF}' | head -n1)
 
-    # 寿命多重提取：
-    #   Micron 5100 → devstat 表格行 "Percentage Used Endurance Indicator"（值在第 4 列，行内无冒号，实测已用 1%）
-    #   部分固件    → 202 Percentage_Used（RAW=已用百分比，如 1 → 99%）
-    #   三星 850 EVO → 177 Wear_Leveling_Count 的 VALUE 列（第 4 列，剩余寿命百分比）
+    # 寿命多重提取
     SATA_USED=$(echo "$SATA_SMART" | grep -i "Percentage Used Endurance Indicator" | awk '{print $4}' | grep -oE '[0-9]+' | head -n1)
     [ -z "$SATA_USED" ] && SATA_USED=$(echo "$SATA_SMART" | grep -E "\b202 Percentage_Used\b" | awk '{print $NF}' | grep -oE '[0-9]+' | head -n1)
     if [ -n "$SATA_USED" ]; then
@@ -105,9 +161,7 @@ if [ -b "$SATA_DEV" ]; then
         fi
     fi
 
-    # 读写总量提取：
-    #   devstat 值带千分位逗号（如 6,338,402,530,321），必须整体提取再去逗号，否则 tail 只取到尾段三位数
-    #   兜底链：devstat → 241/242 标准属性 → 246（Micron 5100 专属，无标准 241）
+    # 读写总量提取
     WRITE_SECTORS=$(echo "$SATA_SMART" | grep -i "Logical Sectors Written" | grep -oE '[0-9,]+' | tail -n1 | tr -d ',')
     [ -z "$WRITE_SECTORS" ] && WRITE_SECTORS=$(echo "$SATA_SMART" | grep -E "\b241 Total_LBAs_Written\b" | awk '{print $NF}' | grep -oE '[0-9]+')
     [ -z "$WRITE_SECTORS" ] && WRITE_SECTORS=$(echo "$SATA_SMART" | grep -E "\b246 Total_LBAs_Written\b" | awk '{print $NF}' | grep -oE '[0-9]+')
@@ -115,7 +169,7 @@ if [ -b "$SATA_DEV" ]; then
     READ_SECTORS=$(echo "$SATA_SMART" | grep -i "Logical Sectors Read" | grep -oE '[0-9,]+' | tail -n1 | tr -d ',')
     [ -z "$READ_SECTORS" ] && READ_SECTORS=$(echo "$SATA_SMART" | grep -E "\b242 Total_LBAs_Read\b" | awk '{print $NF}' | grep -oE '[0-9]+')
 
-    # 格式化读写统计（扇区数 × 512B 换算 TB）
+    # 格式化读写统计
     IO_STAT_STR=""
     if [ -n "$READ_SECTORS" ]; then
         SATA_READ_TB=$(awk "BEGIN {printf \"%.1f\", $READ_SECTORS * 512 / 1000000000000}")
@@ -137,7 +191,6 @@ if [ -b "$SATA_DEV" ]; then
 fi
 
 # ==================== 4. 实时 I/O 简报 ====================
-# 注：不加 -y（老版本 sysstat 不支持），输出两轮，第二段为瞬时采样值
 if command -v iostat &> /dev/null; then
     echo "---------------- [实时 I/O 性能评估] ----------------" >> "$REPORT_FILE"
     iostat -x -d 1 2 >> "$REPORT_FILE"
@@ -145,5 +198,9 @@ if command -v iostat &> /dev/null; then
 fi
 
 # ==================== 5. 发送邮件与清理 ====================
-mail -s "$SUBJECT" "$RECIPIENT" < "$REPORT_FILE"
-rm -f "$REPORT_FILE"
+# 发送失败时保留报告文件，便于排查（bsd-mailx 依赖本机 MTA，如 postfix/msmtp）
+if mail -s "$SUBJECT" "$RECIPIENT" < "$REPORT_FILE"; then
+    rm -f "$REPORT_FILE"
+else
+    echo "ERROR: 邮件发送失败，请检查本机 MTA 配置；报告已保留: $REPORT_FILE" >&2
+fi
