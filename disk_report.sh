@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ============================================================================
-#  disk_check.sh — PVE / Linux 磁盘健康巡检日报脚本
+#  disk_report.sh — PVE / Linux 磁盘健康巡检日报脚本
 # ============================================================================
 #
 #  功能
@@ -24,11 +24,10 @@
 #         export DISK_CHECK_EMAIL=you@example.com
 #       建议写入 /etc/environment 或 cron 定义行持久化
 #    2. 以 root 手动运行一次验证：
-#         sudo -E bash disk_check.sh
-#    3. 挂 cron 定时执行（每天 08:00）：
-#         crontab -e
+#         sudo -E bash disk_report.sh
+#    3. 挂 cron 定时执行（每天 08:00，crontab -e）：
 #         DISK_CHECK_EMAIL=you@example.com
-#         0 8 * * * root /opt/disk_check.sh
+#         0 8 * * * /usr/bin/env bash /root/little-tools/disk_report.sh
 #
 #  ⚠ 注意事项
 #  ---------
@@ -48,7 +47,7 @@
 
 # ==================== 0. 防重入锁 ====================
 # flock 保证同一时刻只有一个实例在跑，后到的直接退出
-LOCK_FILE="/tmp/disk_check.lock"
+LOCK_FILE="/tmp/disk_report.lock"
 exec 9>"$LOCK_FILE"
 flock -n 9 || { echo "已有巡检实例在运行，本次跳过"; exit 1; }
 
